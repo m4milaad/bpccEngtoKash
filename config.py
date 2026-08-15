@@ -49,12 +49,13 @@ TGT_LANG = "kas_Arab"   # Kashmiri (Arabic script — most commonly used)
 # Training Hyperparameters
 # ============================================================
 TRAIN_CONFIG = {
-    "epochs": 3,
-    "batch_size": 8,                 # Adjust based on GPU memory
-    "gradient_accumulation_steps": 4, # Effective batch size = 8 * 4 = 32
-    "learning_rate": 2e-4,
-    "warmup_ratio": 0.05,
+    "epochs": 5,
+    "batch_size": 4,                 # Reduced for 8GB VRAM with r=32 LoRA
+    "gradient_accumulation_steps": 4, # Effective batch size = 4 * 4 = 16
+    "learning_rate": 5e-5,           # Lower LR for stable LoRA training
+    "warmup_ratio": 0.1,             # 10% warmup for stability
     "weight_decay": 0.01,
+    "label_smoothing": 0.1,          # Prevents overconfidence
     "max_source_length": 128,
     "max_target_length": 128,
     "fp16": True,                    # Mixed precision
@@ -68,10 +69,10 @@ TRAIN_CONFIG = {
 # LoRA Configuration (PEFT)
 # ============================================================
 LORA_CONFIG = {
-    "r": 16,                     # LoRA rank
-    "lora_alpha": 32,            # LoRA scaling
+    "r": 32,                     # Higher rank = more capacity
+    "lora_alpha": 64,            # Keep alpha = 2r
     "lora_dropout": 0.05,
-    "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
+    "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj", "fc1", "fc2"],
     "bias": "none",
     "task_type": "SEQ_2_SEQ_LM",
 }
@@ -82,7 +83,7 @@ LORA_CONFIG = {
 INFERENCE_CONFIG = {
     "batch_size": 16,            # Inference batch size (can be larger)
     "max_length": 128,
-    "num_beams": 5,              # Beam search
+    "num_beams": 8,              # More beams = better search
     "length_penalty": 1.0,
     "no_repeat_ngram_size": 3,
     "early_stopping": True,

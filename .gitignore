@@ -16,9 +16,6 @@ env/
 ENV/
 
 # Local data, training artifacts, and generated submissions
-data/
-models/
-outputs/
 logs/
 checkpoints/
 *.ckpt

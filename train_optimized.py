@@ -34,7 +34,7 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
-    get_linear_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
 )
 
 from config import (
@@ -264,13 +264,15 @@ def train(args):
     total_optimizer_steps = (len(train_loader) * args.epochs) // args.gradient_accumulation_steps
     warmup_steps = int(total_optimizer_steps * args.warmup_ratio)
 
-    scheduler = get_linear_schedule_with_warmup(
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_optimizer_steps,
-    )
+)
 
     scaler = torch.amp.GradScaler("cuda") if args.fp16 and device.type == "cuda" else None
+
+    label_smoothing = getattr(args, 'label_smoothing', 0.1)
 
     logger.info(f"\n[*] Training Metrics & Hardware Plan:")
     logger.info(f"    Total Dataset:           {len(train_data):,} pairs")
@@ -281,6 +283,8 @@ def train(args):
     logger.info(f"    Batches per Epoch:       {len(train_loader):,}")
     logger.info(f"    Total Optimizer Updates: {total_optimizer_steps:,}")
     logger.info(f"    Warmup Steps:            {warmup_steps:,}")
+    logger.info(f"    Label Smoothing:         {label_smoothing}")
+    logger.info(f"    LR Schedule:             Cosine Annealing")
     logger.info(f"    Dynamic Padding:         Active (pad_to_multiple_of=8)")
     logger.info(f"    Mixed Precision (fp16):  {args.fp16}")
 
@@ -307,7 +311,29 @@ def train(args):
                         attention_mask=attention_mask,
                         labels=labels,
                     )
-                    loss = outputs.loss / args.gradient_accumulation_steps
+                    # Apply label smoothing
+                    if label_smoothing > 0:
+                        import torch.nn.functional as F
+                        logits = outputs.logits
+                        vocab_size = logits.size(-1)
+                        smooth_labels = labels.clone()
+                        pad_mask = smooth_labels == -100
+                        smooth_labels[pad_mask] = 0
+                        nll_loss = F.cross_entropy(
+                            logits.view(-1, vocab_size),
+                            smooth_labels.view(-1),
+                            reduction='none',
+                            ignore_index=-100,
+                        )
+                        smooth_loss = -F.log_softmax(logits.view(-1, vocab_size), dim=-1).sum(dim=-1)
+                        # Mask out padding
+                        non_pad = (~pad_mask).view(-1).float()
+                        nll_loss = (nll_loss * non_pad).sum() / non_pad.sum().clamp(min=1)
+                        smooth_loss = (smooth_loss * non_pad).sum() / non_pad.sum().clamp(min=1)
+                        loss = (1 - label_smoothing) * nll_loss + label_smoothing * smooth_loss / vocab_size
+                    else:
+                        loss = outputs.loss
+                    loss = loss / args.gradient_accumulation_steps
 
                 scaler.scale(loss).backward()
 
@@ -325,7 +351,28 @@ def train(args):
                     attention_mask=attention_mask,
                     labels=labels,
                 )
-                loss = outputs.loss / args.gradient_accumulation_steps
+                # Apply label smoothing (CPU path)
+                if label_smoothing > 0:
+                    import torch.nn.functional as F
+                    logits = outputs.logits
+                    vocab_size = logits.size(-1)
+                    smooth_labels = labels.clone()
+                    pad_mask = smooth_labels == -100
+                    smooth_labels[pad_mask] = 0
+                    nll_loss = F.cross_entropy(
+                        logits.view(-1, vocab_size),
+                        smooth_labels.view(-1),
+                        reduction='none',
+                        ignore_index=-100,
+                    )
+                    smooth_loss = -F.log_softmax(logits.view(-1, vocab_size), dim=-1).sum(dim=-1)
+                    non_pad = (~pad_mask).view(-1).float()
+                    nll_loss = (nll_loss * non_pad).sum() / non_pad.sum().clamp(min=1)
+                    smooth_loss = (smooth_loss * non_pad).sum() / non_pad.sum().clamp(min=1)
+                    loss = (1 - label_smoothing) * nll_loss + label_smoothing * smooth_loss / vocab_size
+                else:
+                    loss = outputs.loss
+                loss = loss / args.gradient_accumulation_steps
                 loss.backward()
 
                 if (batch_idx + 1) % args.gradient_accumulation_steps == 0:
@@ -385,6 +432,7 @@ def main():
     parser.add_argument("--max_source_length", type=int, default=TRAIN_CONFIG["max_source_length"])
     parser.add_argument("--max_target_length", type=int, default=TRAIN_CONFIG["max_target_length"])
     parser.add_argument("--fp16", action="store_true", default=TRAIN_CONFIG["fp16"])
+    parser.add_argument("--label_smoothing", type=float, default=TRAIN_CONFIG.get("label_smoothing", 0.1))
     args = parser.parse_args()
 
     train(args)
