@@ -1,10 +1,23 @@
 """
-KATHE 2026 — IndicTrans2 Inference Script
+KATHE 2026 — IndicTrans2 Inference Script (multi-GPU aware)
 Translate English sentences to Kashmiri using fine-tuned IndicTrans2.
 
-Usage:
-    python inference_indictrans2.py                                    # Use fine-tuned model
-    python inference_indictrans2.py --model_path models/indictrans2-best
+On a machine with 2+ GPUs (e.g. Kaggle's 2x T4), this automatically splits
+the test set across all visible GPUs and runs independent inference
+processes in parallel for a near-linear speedup. This does NOT need
+accelerate/DDP -- inference has no gradients to sync, so each GPU just
+translates its own slice of sentences with its own model copy.
+
+Usage (Kaggle, 2x T4 -- auto-detected and used):
+    !python inference_indictrans2.py --model_path models/indictrans2-best
+
+Force single-GPU (e.g. to debug):
+    python inference_indictrans2.py --single_gpu
+
+IMPORTANT: run this as a script (`python inference_indictrans2.py`), not by
+pasting the code into a notebook cell directly -- the multi-GPU path uses
+torch.multiprocessing.spawn, which needs this file to be importable as a
+normal module by the child processes.
 """
 
 import argparse
@@ -18,12 +31,14 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+import numpy as np
 import pandas as pd
 import torch
+import torch.multiprocessing as mp
 from tqdm import tqdm
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-from config import TEST_FILE, OUTPUT_DIR, INFERENCE_CONFIG, SUBMISSION_FILE, MODEL_DIR
+from config import TEST_FILE, INFERENCE_CONFIG, SUBMISSION_FILE, MODEL_DIR
 from utils import setup_logging, get_device, load_test_data, save_submission, validate_submission
 
 logger = setup_logging()
@@ -34,67 +49,50 @@ IT2_TGT_LANG = "kas_Arab"
 IT2_MODEL_DIR = MODEL_DIR / "indictrans2-best"
 
 
-def load_model(model_path: str = None, device: torch.device = None):
+def load_model(model_path: str, device: torch.device):
     """Load IndicTrans2 model with optional fine-tuned LoRA adapter."""
-    load_from = model_path if model_path else str(IT2_MODEL_DIR)
-    logger.info(f"[+] Loading IndicTrans2 model")
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        IT2_MODEL_NAME, trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(IT2_MODEL_NAME, trust_remote_code=True)
 
     if model_path:
         try:
             from peft import PeftModel
             base_model = AutoModelForSeq2SeqLM.from_pretrained(
-                IT2_MODEL_NAME,
-                trust_remote_code=True,
-                torch_dtype=torch.float16 if device and device.type == "cuda" else torch.float32,
+                IT2_MODEL_NAME, trust_remote_code=True,
+                torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
             )
             model = PeftModel.from_pretrained(base_model, model_path)
             model = model.merge_and_unload()
             logger.info(f"[+] Loaded fine-tuned IndicTrans2 with LoRA merged from {model_path}")
-        except (ImportError, Exception) as e:
+        except Exception as e:
             logger.info(f"[!] Could not load as LoRA adapter ({e}), trying direct load...")
             model = AutoModelForSeq2SeqLM.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-                dtype=torch.float16 if device and device.type == "cuda" else torch.float32,
+                model_path, trust_remote_code=True,
+                torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
             )
             logger.info("[+] Loaded fine-tuned model directly")
     else:
         model = AutoModelForSeq2SeqLM.from_pretrained(
-            IT2_MODEL_NAME,
-            trust_remote_code=True,
-            dtype=torch.float16 if device and device.type == "cuda" else torch.float32,
+            IT2_MODEL_NAME, trust_remote_code=True,
+            torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
         )
         logger.info("[+] Loaded pretrained IndicTrans2 (zero-shot mode)")
 
     model = model.to(device)
     model.eval()
-
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"    Parameters: {total_params / 1e6:.1f}M")
-
     return model, tokenizer
 
 
 def translate_batch(
-    model, tokenizer, ip, sentences: list[str], device: torch.device,
+    model, tokenizer, ip, sentences: list, device: torch.device,
     max_length: int = INFERENCE_CONFIG["max_length"],
     num_beams: int = INFERENCE_CONFIG["num_beams"],
     **kwargs,
-) -> list[str]:
+) -> list:
     """Translate a batch of English sentences to Kashmiri using IndicTrans2."""
-    # Preprocess with IndicProcessor
     preprocessed = ip.preprocess_batch(sentences, src_lang=IT2_SRC_LANG, tgt_lang=IT2_TGT_LANG)
 
     inputs = tokenizer(
-        preprocessed,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
+        preprocessed, return_tensors="pt", padding=True, truncation=True, max_length=max_length,
     ).to(device)
 
     with torch.no_grad():
@@ -109,32 +107,78 @@ def translate_batch(
         )
 
     raw_translations = tokenizer.batch_decode(generated, skip_special_tokens=True)
-
-    # Postprocess with IndicProcessor
-    translations = ip.postprocess_batch(raw_translations, lang=IT2_TGT_LANG)
-
-    return translations
+    return ip.postprocess_batch(raw_translations, lang=IT2_TGT_LANG)
 
 
 def run_inference(
     model, tokenizer, ip, df: pd.DataFrame, device: torch.device,
     batch_size: int = INFERENCE_CONFIG["batch_size"],
-) -> list[str]:
-    """Run inference on all test sentences."""
+    num_beams: int = INFERENCE_CONFIG["num_beams"],
+    desc: str = "Translating",
+) -> list:
+    """Run inference on all sentences in df."""
     sentences = df["sentence"].tolist()
     all_translations = []
 
-    logger.info(f"[+] Translating {len(sentences)} sentences (batch_size={batch_size})...")
-
-    for i in tqdm(range(0, len(sentences), batch_size), desc="Translating"):
-        batch = sentences[i : i + batch_size]
-        translations = translate_batch(model, tokenizer, ip, batch, device)
-        all_translations.extend(translations)
-
-        if (i + batch_size) % 100 < batch_size:
-            logger.info(f"    Progress: {min(i + batch_size, len(sentences))}/{len(sentences)}")
+    for i in tqdm(range(0, len(sentences), batch_size), desc=desc):
+        batch = sentences[i: i + batch_size]
+        all_translations.extend(
+            translate_batch(model, tokenizer, ip, batch, device, num_beams=num_beams)
+        )
 
     return all_translations
+
+
+def _worker(rank, world_size, model_path, test_file, batch_size, num_beams, tmp_dir):
+    """One process per GPU. Translates only this rank's slice of the test set,
+    then writes a partial CSV for the main process to stitch back together."""
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    try:
+        from IndicTransToolkit import IndicProcessor
+    except ImportError:
+        print("[-] IndicTransToolkit not installed! Run: pip install indictranstoolkit")
+        sys.exit(1)
+    ip = IndicProcessor(inference=True)
+
+    model, tokenizer = load_model(model_path, device)
+    test_df = load_test_data(Path(test_file))
+
+    chunks = np.array_split(np.arange(len(test_df)), world_size)
+    idx = chunks[rank]
+    chunk_df = test_df.iloc[idx].reset_index(drop=True)
+
+    translations = run_inference(
+        model, tokenizer, ip, chunk_df, device, batch_size, num_beams, desc=f"GPU{rank}"
+    )
+
+    out = pd.DataFrame({"ID": chunk_df["ID"].tolist(), "kashmiri_text": translations})
+    out.to_csv(Path(tmp_dir) / f"_partial_rank{rank}.csv", index=False, encoding="utf-8")
+
+
+def run_multi_gpu_inference(args, world_size: int) -> pd.DataFrame:
+    """Spawn one process per GPU, each translating a slice of the test set,
+    then merge the partial outputs back into ID order."""
+    tmp_dir = Path(args.output).parent
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"[+] Splitting inference across {world_size} GPUs")
+    mp.spawn(
+        _worker,
+        args=(world_size, args.model_path, args.test_file, args.batch_size, args.num_beams, str(tmp_dir)),
+        nprocs=world_size,
+        join=True,
+    )
+
+    parts = []
+    for rank in range(world_size):
+        part_path = tmp_dir / f"_partial_rank{rank}.csv"
+        parts.append(pd.read_csv(part_path))
+        part_path.unlink()
+
+    combined = pd.concat(parts, ignore_index=True).sort_values("ID").reset_index(drop=True)
+    return combined
 
 
 def main():
@@ -143,60 +187,58 @@ def main():
         "--model_path", type=str, default=str(IT2_MODEL_DIR),
         help="Path to fine-tuned IndicTrans2 checkpoint",
     )
+    parser.add_argument("--test_file", type=str, default=str(TEST_FILE))
+    parser.add_argument("--output", type=str, default=str(SUBMISSION_FILE))
+    parser.add_argument("--batch_size", type=int, default=INFERENCE_CONFIG["batch_size"])
+    parser.add_argument("--num_beams", type=int, default=INFERENCE_CONFIG["num_beams"])
     parser.add_argument(
-        "--test_file", type=str, default=str(TEST_FILE),
-        help="Path to test CSV file",
+        "--single_gpu", action="store_true",
+        help="Force single-GPU inference even if more than one GPU is visible",
     )
-    parser.add_argument(
-        "--output", type=str, default=str(SUBMISSION_FILE),
-        help="Path to output submission CSV",
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=INFERENCE_CONFIG["batch_size"],
-        help="Inference batch size",
-    )
-    parser.add_argument(
-        "--num_beams", type=int, default=INFERENCE_CONFIG["num_beams"],
-        help="Number of beams for beam search",
-    )
-
     args = parser.parse_args()
 
     logger.info("=" * 60)
     logger.info("KATHE 2026 -- IndicTrans2 English->Kashmiri")
     logger.info("=" * 60)
 
-    # Load IndicProcessor
-    try:
-        from IndicTransToolkit import IndicProcessor
-        ip = IndicProcessor(inference=True)
-        logger.info("[+] IndicProcessor loaded (inference mode)")
-    except ImportError:
-        logger.error("[-] IndicTransToolkit not installed! Run: pip install indictranstoolkit")
-        sys.exit(1)
-
-    device = get_device()
-    model, tokenizer = load_model(args.model_path, device)
-    test_df = load_test_data(Path(args.test_file))
-
+    n_gpus = torch.cuda.device_count()
     start_time = time.time()
-    translations = run_inference(model, tokenizer, ip, test_df, device, args.batch_size)
-    elapsed = time.time() - start_time
 
+    if not args.single_gpu and n_gpus > 1:
+        logger.info(f"[+] Detected {n_gpus} GPUs -- running parallel inference")
+        result_df = run_multi_gpu_inference(args, n_gpus)
+        ids = result_df["ID"].tolist()
+        translations = result_df["kashmiri_text"].tolist()
+    else:
+        try:
+            from IndicTransToolkit import IndicProcessor
+            ip = IndicProcessor(inference=True)
+            logger.info("[+] IndicProcessor loaded (inference mode)")
+        except ImportError:
+            logger.error("[-] IndicTransToolkit not installed! Run: pip install indictranstoolkit")
+            sys.exit(1)
+
+        device = get_device()
+        model, tokenizer = load_model(args.model_path, device)
+        test_df = load_test_data(Path(args.test_file))
+        translations = run_inference(
+            model, tokenizer, ip, test_df, device, args.batch_size, args.num_beams
+        )
+        ids = test_df["ID"].tolist()
+
+    elapsed = time.time() - start_time
     logger.info(f"[+] Translation completed in {elapsed:.1f}s ({elapsed/len(translations):.2f}s/sentence)")
 
     logger.info("\n[*] Sample translations:")
     for i in range(min(5, len(translations))):
-        logger.info(f"    EN: {test_df['sentence'].iloc[i]}")
         try:
-            logger.info(f"    KS: {translations[i]}")
+            logger.info(f"    ID {ids[i]}: {translations[i]}")
         except Exception:
             pass
-        logger.info("")
 
     output_path = Path(args.output)
-    save_submission(test_df["ID"].tolist(), translations, output_path)
-    validate_submission(output_path, expected_count=len(test_df))
+    save_submission(ids, translations, output_path)
+    validate_submission(output_path, expected_count=len(ids))
 
     logger.info("\n[+] Done!")
     logger.info(f"    Submission file: {output_path}")

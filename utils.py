@@ -61,6 +61,19 @@ def get_device():
     return device
 
 
+def print_gpu_summary():
+    """Print name + VRAM for every visible GPU. Handy on Kaggle to confirm
+    both T4s are actually visible before kicking off a multi-GPU run."""
+    n = torch.cuda.device_count()
+    if n == 0:
+        safe_print("[!] No GPU found -- using CPU (this will be slow)")
+        return
+    safe_print(f"[+] Detected {n} GPU(s):")
+    for i in range(n):
+        props = torch.cuda.get_device_properties(i)
+        safe_print(f"    GPU {i}: {props.name} ({props.total_memory / 1024**3:.1f} GB VRAM)")
+
+
 def load_test_data(test_file: Path) -> pd.DataFrame:
     """Load the test CSV file (englishdev.csv)."""
     df = pd.read_csv(test_file)
