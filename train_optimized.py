@@ -156,6 +156,13 @@ def setup_model_for_training(model_name: str, device: torch.device):
     model = get_peft_model(model, lora_config)
     model = model.to(device)
 
+    # Keep optimizer-owned LoRA weights in fp32.  AdamW's default epsilon
+    # (1e-8) underflows in fp16 and can corrupt adapter updates; autocast still
+    # runs the frozen base model efficiently in fp16.
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            parameter.data = parameter.data.float()
+
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(
@@ -223,7 +230,10 @@ def train(args):
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=data_collator,
-        num_workers=2,
+        # NLLB's mutable language-tokenizer state is not reliable through
+        # Windows worker processes; single-process loading keeps each batch
+        # tokenized consistently.
+        num_workers=0,
         pin_memory=True if device.type == "cuda" else False,
     )
 
@@ -240,12 +250,13 @@ def train(args):
             batch_size=args.batch_size * 2,
             shuffle=False,
             collate_fn=data_collator,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True if device.type == "cuda" else False,
         )
 
+    trainable_parameters = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        trainable_parameters,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -275,6 +286,7 @@ def train(args):
 
     best_val_loss = float("inf")
     opt_step = 0
+    optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(args.epochs):
         model.train()
