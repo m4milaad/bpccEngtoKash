@@ -31,6 +31,8 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+import re
+import unicodedata
 import numpy as np
 import pandas as pd
 import torch
@@ -47,6 +49,15 @@ IT2_MODEL_NAME = "ai4bharat/indictrans2-en-indic-1B"
 IT2_SRC_LANG = "eng_Latn"
 IT2_TGT_LANG = "kas_Arab"
 IT2_MODEL_DIR = MODEL_DIR / "indictrans2-best"
+
+
+def clean_and_normalize_kashmiri(text: str) -> str:
+    """Strip language tag prefixes (kas@Arab, kas_Arab, etc.) and apply NFKC normalization."""
+    text = str(text)
+    text = re.sub(r"^(?:kas[@_/\s0-9]*Arab|<2kas_Arab>|__kas_Arab__|\s+)+", "", text, flags=re.IGNORECASE)
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("ك", "ک").replace("ي", "ی").replace("ى", "ی")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def load_model(model_path: str, device: torch.device):
@@ -226,10 +237,13 @@ def main():
         )
         ids = test_df["ID"].tolist()
 
+    # Clean and normalize all translations
+    translations = [clean_and_normalize_kashmiri(t) for t in translations]
+
     elapsed = time.time() - start_time
     logger.info(f"[+] Translation completed in {elapsed:.1f}s ({elapsed/len(translations):.2f}s/sentence)")
 
-    logger.info("\n[*] Sample translations:")
+    logger.info("\n[*] Sample translations (Cleaned & Normalized):")
     for i in range(min(5, len(translations))):
         try:
             logger.info(f"    ID {ids[i]}: {translations[i]}")
@@ -242,6 +256,7 @@ def main():
 
     logger.info("\n[+] Done!")
     logger.info(f"    Submission file: {output_path}")
+
 
 
 if __name__ == "__main__":
