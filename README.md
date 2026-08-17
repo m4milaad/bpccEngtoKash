@@ -8,6 +8,53 @@
 
 This project implements an English-to-Kashmiri machine translation pipeline for the KATHE 2026 Kaggle competition. It supports both zero-shot inference with pretrained multilingual models and fine-tuning on the BPCC (Bharat Parallel Corpus Collection) using LoRA for parameter-efficient training.
 
+## Methodology
+
+### 1. Data Preparation
+- **Corpus**: BPCC (Bharat Parallel Corpus Collection) — English↔Kashmiri parallel sentences
+- **Preprocessing**: 
+  - Filter empty/duplicate pairs
+  - Length filtering (max 128 tokens source/target)
+  - Train/validation split (95/5)
+  - Kashmiri in Arabic script (`kas_Arab`)
+
+### 2. Base Models
+- **NLLB-200 Distilled 600M** (default): Meta's multilingual model covering 200 languages, including Kashmiri (`kas_Arab`)
+- **IndicTrans2 EN→Indic 1B** (alternative): AI4Bharat's model optimized for Indian languages
+
+### 3. Fine-Tuning Strategy: LoRA (Low-Rank Adaptation)
+- **Why LoRA**: Full fine-tuning requires >24GB VRAM; LoRA freezes base model and trains only low-rank adapter matrices (~0.5-2% parameters)
+- **Configuration** (`config.py:71-78`):
+  - Rank `r=32`, Alpha `64` (α=2r)
+  - Dropout `0.05`
+  - Target modules: `q_proj`, `v_proj`, `k_proj`, `o_proj`, `fc1`, `fc2` (attention + FFN)
+  - Task type: `SEQ_2_SEQ_LM`
+
+### 4. Training Hyperparameters
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| Epochs | 5 | Balance convergence vs overfitting |
+| Batch size | 4 (+ grad accum 4) | Effective batch 16, fits 8GB VRAM |
+| Learning rate | 5e-5 | Lower LR for stable adapter training |
+| Warmup | 10% | Stabilizes early training |
+| Label smoothing | 0.1 | Prevents overconfidence |
+| Precision | FP16 | Memory efficiency |
+| Seed | 42 | Reproducibility |
+
+### 5. Inference & Decoding
+- **Beam search**: 8 beams, length penalty 1.0
+- **Constraints**: No repeat 3-grams, early stopping
+- **Batch size**: 16 (inference can use larger batches)
+
+### 6. Ensemble (Optional)
+- **MBR (Minimum Bayes Risk)**: Generate N-best candidates (n=5) from multiple checkpoints, rerank by expected chrF++ against each other
+- **Checkpoints**: Best model + epoch checkpoints (e.g., epoch 3, 5)
+
+### 7. Evaluation
+- **Metrics**: BLEU (n-gram precision) + chrF++ (character n-gram F-score)
+- **Competition score**: Geometric mean `√(BLEU × chrF++)`
+- **Validation**: Held-out BPCC split (separate from test)
+
 ## Model
 
 - **Primary**: [NLLB-200 Distilled 600M](https://huggingface.co/facebook/nllb-200-distilled-600M) — Meta's multilingual translation model supporting 200 languages including Kashmiri

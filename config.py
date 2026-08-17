@@ -90,6 +90,16 @@ INFERENCE_CONFIG = {
 }
 
 # ============================================================
+# MBR Ensemble Configuration
+# ============================================================
+ENSEMBLE_CONFIG = {
+    "n_candidates": 5,           # N-best per model (total pool = n * num_models)
+    "num_beams": 10,             # Must be >= n_candidates
+    "batch_size": 8,             # Inference batch size for candidate generation
+    "max_length": 128,
+}
+
+# ============================================================
 # Submission
 # ============================================================
 SUBMISSION_FILE = OUTPUT_DIR / "submission.csv"

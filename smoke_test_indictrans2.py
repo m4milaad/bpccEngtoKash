@@ -20,12 +20,15 @@ from transformers import (
 import torch.nn.functional as F
 
 from config import BPCC_DIR
-from utils import get_device
+from utils import get_device, print_gpu_summary
 
 IT2_MODEL_NAME = "ai4bharat/indictrans2-en-indic-1B"
 IT2_SRC_LANG = "eng_Latn"
 IT2_TGT_LANG = "kas_Arab"
 
+# This smoke test is deliberately single-GPU (rank 0 only) -- it's meant as a
+# fast (~1 min) sanity check before launching the full multi-GPU job via
+# `accelerate launch train_indictrans2.py` (see accelerate_config.yaml).
 def vram_report(label):
     if torch.cuda.is_available():
         alloc = torch.cuda.memory_allocated() / 1024**3
@@ -37,9 +40,17 @@ print("=" * 60)
 print("SMOKE TEST - IndicTrans2-1B Validation")
 print("=" * 60)
 
+print_gpu_summary()
+if torch.cuda.device_count() > 1:
+    print("  Note: this smoke test only exercises GPU 0. Full training will")
+    print("        use all detected GPUs via accelerate -- see train_indictrans2.py.")
+
 device = get_device()
 if torch.cuda.is_available():
     torch.cuda.reset_peak_memory_stats()
+    gpu_total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+else:
+    gpu_total_gb = 0.0
 
 # 1. Test IndicTransToolkit Import
 print("\n[1/6] Checking IndicTransToolkit...")
@@ -169,8 +180,8 @@ print("[6/6] VRAM Summary:")
 if torch.cuda.is_available():
     peak = torch.cuda.max_memory_allocated() / 1024**3
     print(f"  Peak memory used:  {peak:.2f} GB")
-    print(f"  GPU total:         8.00 GB")
-    print(f"  Headroom:          {8.0 - peak:.2f} GB")
+    print(f"  GPU total:         {gpu_total_gb:.2f} GB")
+    print(f"  Headroom:          {gpu_total_gb - peak:.2f} GB")
 
 print("\n" + "=" * 60)
 print("INDICTRANS2 SMOKE TEST COMPLETE!")
